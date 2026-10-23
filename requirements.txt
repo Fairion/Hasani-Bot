@@ -1,0 +1,12 @@
+torch
+transformers
+huggingface_hub
+einops
+safetensors
+tqdm
+numpy
+pandas
+requests
+yfinance
+google-genai
+matplotlib
