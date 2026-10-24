@@ -1,65 +1,120 @@
 import os
 import sys
 import io
+import gc
 import json
 import time
+import zipfile
 import threading
-import subprocess
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# Use thread-safe headless Matplotlib backend
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-# Clone shiyu-coder/Kronos into /tmp on container startup
-if not os.path.exists("/tmp/Kronos"):
-    print("📦 Cloning shiyu-coder/Kronos repository...")
-    subprocess.run(
-        ["git", "clone", "--depth", "1", "https://github.com/shiyu-coder/Kronos.git", "/tmp/Kronos"],
-        check=True
-    )
-if "/tmp/Kronos" not in sys.path:
-    sys.path.insert(0, "/tmp/Kronos")
-
 import numpy as np
 import pandas as pd
 import requests
-import torch
 import yfinance as yf
-import gradio as gr
 from google import genai
-from model import Kronos, KronosTokenizer, KronosPredictor
 
 # ==============================================================================
-# CONFIGURATION & ENVIRONMENT VARIABLES
+# CONFIGURATION & RENDER FREE-TIER MEMORY SETTINGS
 # ==============================================================================
 DEFAULT_INTERVAL   = "15m"
-LOOKBACK           = 512
-PRED_LEN           = 24
-SAMPLE_COUNT       = 100
+LOOKBACK           = int(os.environ.get("LOOKBACK", "256"))      # 256 candles keeps RAM safely < 512 MB
+PRED_LEN           = int(os.environ.get("PRED_LEN", "24"))
+SAMPLE_COUNT       = int(os.environ.get("SAMPLE_COUNT", "30"))   # 30 Monte Carlo paths for fast 0.1-CPU replies
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
 
 MODEL_LOCK = threading.Lock()
-BOT_STATUS = "⏳ Initializing Kronos-small..."
-
-# ==============================================================================
-# LOAD & CACHE KRONOS-SMALL ONCE AT STARTUP
-# ==============================================================================
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"⚡ Loading NeoQuasar/Kronos-small on {DEVICE}...")
-TOKENIZER = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-MODEL = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-PREDICTOR = KronosPredictor(MODEL, TOKENIZER, device=DEVICE, max_context=512)
-print("✅ Kronos-small loaded and cached!")
+PREDICTOR  = None
+BOT_STATUS = "⏳ Booting container & downloading Kronos-small in background..."
 
 
 # ==============================================================================
-# CORE FORECASTING, BACKTEST & VERIFIED STOP-LOSS ENGINE
+# 1. INSTANT HEALTH-CHECK SERVER (Satisfies Render Port Scan Immediately)
 # ==============================================================================
-def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 512, source: str = "stocks") -> pd.DataFrame:
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        html = (
+            "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;'>"
+            "<h2>📈 Kronos + Gemini Telegram Bot (Render Cloud)</h2>"
+            f"<p><b>Status:</b> {BOT_STATUS}</p>"
+            f"<p><b>Settings:</b> Lookback={LOOKBACK} | Horizon={PRED_LEN} | Samples={SAMPLE_COUNT}</p>"
+            "</body></html>"
+        )
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return  # Keep Render logs clean
+
+
+# ==============================================================================
+# 2. PURE-PYTHON KRONOS LOADER (No git binary required, <512 MB RAM safe)
+# ==============================================================================
+def load_kronos_predictor():
+    global PREDICTOR, BOT_STATUS
+    import torch
+    torch.set_grad_enabled(False)
+    torch.set_num_threads(2)
+
+    target_base = "/tmp/kronos_repo"
+    os.makedirs(target_base, exist_ok=True)
+    repo_dir = None
+
+    for name in os.listdir(target_base):
+        candidate = os.path.join(target_base, name)
+        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "model")):
+            repo_dir = candidate
+            break
+
+    if not repo_dir:
+        BOT_STATUS = "📦 Downloading shiyu-coder/Kronos source archive..."
+        print(BOT_STATUS, flush=True)
+        resp = requests.get("https://github.com/shiyu-coder/Kronos/archive/HEAD.zip", timeout=30)
+        resp.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            zf.extractall(target_base)
+        for name in os.listdir(target_base):
+            candidate = os.path.join(target_base, name)
+            if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "model")):
+                repo_dir = candidate
+                break
+
+    if not repo_dir:
+        raise RuntimeError("Could not locate Kronos 'model' folder after extraction.")
+
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+
+    from model import Kronos, KronosTokenizer, KronosPredictor
+
+    BOT_STATUS = "⚡ Loading NeoQuasar/Kronos-small weights on CPU..."
+    print(BOT_STATUS, flush=True)
+    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+    model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+    model.eval()
+    PREDICTOR = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+    gc.collect()
+    print("✅ Kronos-small loaded successfully!", flush=True)
+
+
+# ==============================================================================
+# 3. CORE FORECASTING, BACKTEST & VERIFIED STOP-LOSS ENGINE
+# ==============================================================================
+def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, source: str = "stocks") -> pd.DataFrame:
     symbol = symbol.strip().upper()
     if source == "binance":
         endpoints = [
@@ -96,6 +151,8 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 512, sourc
         yf_int = yf_interval_map.get(interval, "15m")
         period = "60d" if yf_int in ["2m", "5m", "15m", "30m", "60m"] else ("7d" if yf_int == "1m" else "2y")
         df = yf.Ticker(symbol).history(period=period, interval=yf_int)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         if df.empty or len(df) < 10:
             raise ValueError(f"Not enough stock data returned for '{symbol}' on {interval}.")
         df = df.tail(lookback).reset_index()
@@ -106,7 +163,8 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 512, sourc
         return df[["timestamps", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
 
 
-def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int = 100):
+def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int = 30):
+    import torch
     time_delta = df["timestamps"].diff().median()
     if pd.isna(time_delta) or time_delta.total_seconds() <= 0:
         time_delta = pd.Timedelta(minutes=15)
@@ -116,16 +174,17 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
     x_timestamp = df["timestamps"]
 
     all_paths_close = []
-    with MODEL_LOCK:
+    with MODEL_LOCK, torch.inference_mode():
         try:
-            batch_size = 25
+            # Small batch size (5) prevents 512 MB RAM spikes on Render Free Tier
+            batch_size = 5
             remaining = sample_count
             while remaining > 0:
                 cur_batch = min(batch_size, remaining)
                 preds = PREDICTOR.predict_batch(
-                    df_list=[x_df.copy() for _ in range(cur_batch)],
-                    x_timestamp_list=[x_timestamp.copy() for _ in range(cur_batch)],
-                    y_timestamp_list=[future_timestamps.copy() for _ in range(cur_batch)],
+                    df_list=[x_df for _ in range(cur_batch)],
+                    x_timestamp_list=[x_timestamp for _ in range(cur_batch)],
+                    y_timestamp_list=[future_timestamps for _ in range(cur_batch)],
                     pred_len=pred_len,
                     T=1.0,
                     top_p=0.9,
@@ -150,6 +209,7 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
                 )
                 all_paths_close.append(pred_df["close"].values)
 
+    gc.collect()
     return future_timestamps, np.array(all_paths_close)
 
 
@@ -187,7 +247,7 @@ def analyze_paths(df: pd.DataFrame, paths_matrix: np.ndarray) -> dict:
 
 
 def run_backtest_with_fees(symbol: str, interval: str, source: str, fee_bps: float = 10.0, slippage_bps: float = 5.0) -> dict:
-    df_hist = fetch_candles(symbol, interval=interval, lookback=1000, source=source)
+    df_hist = fetch_candles(symbol, interval=interval, lookback=800, source=source)
     closes = df_hist["close"].values
     round_trip_cost = 2.0 * ((fee_bps + slippage_bps) / 10000.0)
     trades = []
@@ -249,7 +309,7 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
         try:
             client = genai.Client(api_key=api_key)
             prompt = f"""
-            You are a quantitative trading engine analyzing Kronos-small (100 Monte Carlo candlestick futures).
+            You are a quantitative trading engine analyzing Kronos-small ({stats['total_paths']} Monte Carlo candlestick futures).
             Asset: {symbol} ({interval}) | Last Close: {last_c} | ATR(14): {atr:.4f}
             Regime: {stats['regime']} ({stats['paths_up']}/{stats['total_paths']} paths up)
             Lowest p10 dip across 24 bars: {p10_path_min:.2f} | Highest p90 peak: {p90_path_max:.2f}
@@ -307,7 +367,7 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
 def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, paths_matrix: np.ndarray, stats: dict, plan: dict) -> io.BytesIO:
     with MODEL_LOCK:
         plt.style.use("dark_background")
-        fig, ax = plt.subplots(figsize=(10, 5), dpi=140)
+        fig, ax = plt.subplots(figsize=(9, 4.5), dpi=120)
         fig.patch.set_facecolor("#0b0e14")
         ax.set_facecolor("#0b0e14")
 
@@ -319,7 +379,7 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
 
         last_close = hist_closes[-1]
         for path in paths_matrix:
-            ax.plot(fut_x, np.concatenate([[last_close], path]), color="#94a3b8", alpha=0.08, linewidth=0.8)
+            ax.plot(fut_x, np.concatenate([[last_close], path]), color="#94a3b8", alpha=0.12, linewidth=0.8)
 
         ax.plot(fut_x, np.concatenate([[last_close], stats["p90_path"]]), color="#38bdf8", linestyle="--", linewidth=1.8, label="p90 (Upper)")
         ax.plot(fut_x, np.concatenate([[last_close], stats["median_path"]]), color="#facc15", linewidth=2.4, label="Median Forecast")
@@ -328,7 +388,7 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
         ax.hlines(plan["stop_loss"], fut_x[0], fut_x[-1], colors="#ef4444", linestyles=":", linewidth=1.5, label=f"Stop ({plan['stop_loss']:,.2f})")
         ax.hlines(plan["target"], fut_x[0], fut_x[-1], colors="#22c55e", linestyles=":", linewidth=1.5, label=f"Target ({plan['target']:,.2f})")
 
-        ax.set_title(f"KRONOS 100-PATH FORECAST: {symbol} ({interval}) — {stats['regime']}", color="white", fontsize=12, fontweight="bold")
+        ax.set_title(f"KRONOS FORECAST: {symbol} ({interval}) — {stats['regime']}", color="white", fontsize=11, fontweight="bold")
         ax.grid(color="#1f2937", linestyle="--", linewidth=0.5)
         ax.legend(loc="upper left", fontsize=8, facecolor="#111827", edgecolor="#374151")
 
@@ -337,17 +397,25 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
         plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
         plt.close(fig)
         buf.seek(0)
+        gc.collect()
         return buf
 
 
 # ==============================================================================
-# BACKGROUND 24/7 TELEGRAM BOT THREAD
+# 4. BACKGROUND MODEL BOOTSTRAP + 24/7 TELEGRAM LISTENER
 # ==============================================================================
-def telegram_bot_worker():
+def bootstrap_and_run_bot():
     global BOT_STATUS
+    try:
+        load_kronos_predictor()
+    except Exception as e:
+        BOT_STATUS = f"❌ Model load error: {e}"
+        print(traceback.format_exc(), flush=True)
+        return
+
     if not TELEGRAM_BOT_TOKEN:
-        BOT_STATUS = "⚠️ TELEGRAM_BOT_TOKEN secret is not set."
-        print(BOT_STATUS)
+        BOT_STATUS = "⚠️ TELEGRAM_BOT_TOKEN is missing in Render Environment Variables."
+        print(BOT_STATUS, flush=True)
         return
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -356,10 +424,12 @@ def telegram_bot_worker():
         me = requests.get(f"{base_url}/getMe", timeout=10).json()
         if not me.get("ok"):
             BOT_STATUS = f"❌ Invalid TELEGRAM_BOT_TOKEN: {me}"
+            print(BOT_STATUS, flush=True)
             return
         bot_username = me["result"].get("username", "Bot")
     except Exception as e:
         BOT_STATUS = f"❌ Telegram connection error: {e}"
+        print(BOT_STATUS, flush=True)
         return
 
     offset = None
@@ -370,13 +440,15 @@ def telegram_bot_worker():
     except Exception:
         pass
 
-    BOT_STATUS = f"🟢 Online 24/7 on Cloud (@{bot_username})"
+    BOT_STATUS = f"🟢 Online 24/7 on Render (@{bot_username})"
+    print(BOT_STATUS, flush=True)
+
     if TELEGRAM_CHAT_ID:
         requests.post(f"{base_url}/sendMessage", json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": (
-                f"☁️ <b>@{bot_username} is now LIVE 24/7 on Cloud!</b>\n"
-                f"Your PC can stay off. Text any ticker like <code>NVDA 15m</code> or <code>BTCUSDT 1h</code>."
+                f"☁️ <b>@{bot_username} is LIVE on Render Cloud!</b>\n"
+                f"Send any ticker like <code>NVDA 15m</code>, <code>SHFS 15m</code>, or <code>BTCUSDT 1h</code>."
             ),
             "parse_mode": "HTML"
         })
@@ -424,7 +496,7 @@ def telegram_bot_worker():
                 if req_source == "stocks":
                     if raw_tf == "3m":
                         req_interval = "5m"
-                        tf_note = " <i>(Yahoo Finance doesn't have 3m stock bars — switched to 5m)</i>"
+                        tf_note = " <i>(switched 3m &rarr; 5m for Yahoo Finance)</i>"
                     elif raw_tf in valid_stock_tf:
                         req_interval = raw_tf
                     else:
@@ -434,7 +506,7 @@ def telegram_bot_worker():
 
                 requests.post(f"{base_url}/sendMessage", json={
                     "chat_id": chat_id,
-                    "text": f"⏳ Running 100 Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}",
+                    "text": f"⏳ Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}",
                     "parse_mode": "HTML"
                 })
 
@@ -475,19 +547,9 @@ def telegram_bot_worker():
         except Exception:
             time.sleep(4)
 
-# Start background Telegram listener
-threading.Thread(target=telegram_bot_worker, daemon=True).start()
-
-# Gradio status page
-def get_status():
-    return f"**Bot Status:** {BOT_STATUS}  \n**Compute Device:** `{DEVICE}` | **Samples:** `{SAMPLE_COUNT}`"
-
-with gr.Blocks(title="Kronos Telegram Bot") as demo:
-    gr.Markdown("## 📈 Kronos + Gemini Cloud Telegram Bot")
-    status_md = gr.Markdown(get_status)
-    refresh_btn = gr.Button("Refresh Status")
-    refresh_btn.click(fn=get_status, outputs=status_md)
 
 if __name__ == "__main__":
+    threading.Thread(target=bootstrap_and_run_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    print(f"🌐 Binding health-check HTTP server on 0.0.0.0:{port}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
