@@ -2,23 +2,17 @@ import os
 import sys
 import io
 import gc
+import re
 import json
 import time
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import requests
-import yfinance as yf
-from google import genai
 
 # ==============================================================================
-# AUTO-CLEAN ENVIRONMENT VARIABLES (Strips accidental quotes & spaces)
+# AUTO-CLEAN ENVIRONMENT VARIABLES
 # ==============================================================================
 def clean_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip().strip('"').strip("'")
@@ -29,7 +23,11 @@ PRED_LEN            = int(clean_env("PRED_LEN", "24"))
 SAMPLE_COUNT        = int(clean_env("SAMPLE_COUNT", "30"))
 
 TELEGRAM_BOT_TOKEN  = clean_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID    = clean_env("TELEGRAM_CHAT_ID")
+RAW_CHAT_ID         = clean_env("TELEGRAM_CHAT_ID")
+# Extract pure digits (and optional leading minus sign) in case extra text was pasted
+CLEAN_CHAT_ID_MATCH = re.search(r"-?\d+", RAW_CHAT_ID)
+TELEGRAM_CHAT_ID    = CLEAN_CHAT_ID_MATCH.group(0) if CLEAN_CHAT_ID_MATCH else ""
+
 GEMINI_API_KEY      = clean_env("GEMINI_API_KEY")
 RENDER_EXTERNAL_URL = clean_env("RENDER_EXTERNAL_URL").rstrip("/")
 
@@ -39,11 +37,12 @@ PREDICTOR         = None
 PROCESSED_UPDATES = set()
 
 BOT_STATUS   = "⏳ Connecting to Telegram..."
-MODEL_STATUS = "⏳ Waiting to preload Kronos-small..."
+MODEL_STATUS = "💤 Lazy-load standby (loads on first ticker request, <350 MB RAM)"
+LAST_EVENT   = "None yet"
 
 
 # ==============================================================================
-# 1. ULTRA-LIGHTWEIGHT KRONOS LOADER (Downloads only 3 .py files = ~25 KB)
+# 1. MEMORY-SAFE KRONOS-MINI LOADER (<350 MB Total RAM for Render Free Tier)
 # ==============================================================================
 def ensure_kronos_loaded():
     global PREDICTOR, MODEL_STATUS
@@ -62,39 +61,45 @@ def ensure_kronos_loaded():
         model_dir = os.path.join(pkg_root, "model")
         os.makedirs(model_dir, exist_ok=True)
 
-        MODEL_STATUS = "📦 Fetching Kronos model scripts (25 KB)..."
-        print(MODEL_STATUS, flush=True)
-        raw_base = "https://raw.githubusercontent.com/shiyu-coder/Kronos/master/model"
+        MODEL_STATUS = "📦 Downloading Kronos model scripts..."
         for fname in ["__init__.py", "module.py", "kronos.py"]:
             fpath = os.path.join(model_dir, fname)
             if not os.path.exists(fpath):
-                r = requests.get(f"{raw_base}/{fname}", timeout=20)
-                r.raise_for_status()
-                with open(fpath, "wb") as f:
-                    f.write(r.content)
+                fetched = False
+                for branch in ["master", "main"]:
+                    url = f"https://raw.githubusercontent.com/shiyu-coder/Kronos/{branch}/model/{fname}"
+                    r = requests.get(url, timeout=20)
+                    if r.status_code == 200:
+                        with open(fpath, "wb") as f:
+                            f.write(r.content)
+                        fetched = True
+                        break
+                if not fetched:
+                    raise RuntimeError(f"Failed to download Kronos {fname} from GitHub.")
 
         if pkg_root not in sys.path:
             sys.path.insert(0, pkg_root)
 
         from model import Kronos, KronosTokenizer, KronosPredictor
 
-        MODEL_STATUS = "⚡ Loading NeoQuasar/Kronos-small on CPU..."
-        print(MODEL_STATUS, flush=True)
-        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-        model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+        MODEL_STATUS = "⚡ Loading NeoQuasar/Kronos-mini (CPU-optimized)..."
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k")
+        model = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
         model.eval()
         PREDICTOR = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
         gc.collect()
 
-        MODEL_STATUS = "✅ Kronos-small Loaded & Ready"
-        print(MODEL_STATUS, flush=True)
+        MODEL_STATUS = "✅ NeoQuasar/Kronos-mini Loaded & Cached"
         return PREDICTOR
 
 
 # ==============================================================================
-# 2. CORE FORECASTING, BACKTEST & VERIFIED STOP-LOSS ENGINE
+# 2. DATA, FORECAST, BACKTEST & VERIFIED STOP-LOSS ENGINE
 # ==============================================================================
-def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, source: str = "stocks") -> pd.DataFrame:
+def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, source: str = "stocks"):
+    import pandas as pd
+    import yfinance as yf
+
     symbol = symbol.strip().upper()
     if source == "binance":
         endpoints = [
@@ -143,9 +148,12 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, sourc
         return df[["timestamps", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
 
 
-def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int = 30):
-    predictor = ensure_kronos_loaded()
+def run_kronos_forecast(df, pred_len: int = 24, sample_count: int = 30):
+    import numpy as np
+    import pandas as pd
     import torch
+
+    predictor = ensure_kronos_loaded()
 
     time_delta = df["timestamps"].diff().median()
     if pd.isna(time_delta) or time_delta.total_seconds() <= 0:
@@ -158,7 +166,7 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
     all_paths_close = []
     with INFER_LOCK, torch.inference_mode():
         try:
-            batch_size = 5
+            batch_size = 6
             remaining = sample_count
             while remaining > 0:
                 cur_batch = min(batch_size, remaining)
@@ -194,7 +202,8 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
     return future_timestamps, np.array(all_paths_close)
 
 
-def analyze_paths(df: pd.DataFrame, paths_matrix: np.ndarray) -> dict:
+def analyze_paths(df, paths_matrix) -> dict:
+    import numpy as np
     last_close = float(df["close"].iloc[-1])
     final_closes = paths_matrix[:, -1]
     paths_up = int(np.sum(final_closes > last_close))
@@ -228,7 +237,8 @@ def analyze_paths(df: pd.DataFrame, paths_matrix: np.ndarray) -> dict:
 
 
 def run_backtest_with_fees(symbol: str, interval: str, source: str, fee_bps: float = 10.0, slippage_bps: float = 5.0) -> dict:
-    df_hist = fetch_candles(symbol, interval=interval, lookback=800, source=source)
+    import numpy as np
+    df_hist = fetch_candles(symbol, interval=interval, lookback=600, source=source)
     closes = df_hist["close"].values
     round_trip_cost = 2.0 * ((fee_bps + slippage_bps) / 10000.0)
     trades = []
@@ -252,7 +262,8 @@ def run_backtest_with_fees(symbol: str, interval: str, source: str, fee_bps: flo
     }
 
 
-def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stats: dict, backtest: dict, api_key: str) -> dict:
+def build_verified_trade_plan(symbol: str, interval: str, df, stats: dict, backtest: dict, api_key: str) -> dict:
+    import numpy as np
     last_c = float(stats["last_close"])
     p10_path_min = float(np.min(stats["p10_path"]))
     p90_path_max = float(np.max(stats["p90_path"]))
@@ -288,9 +299,10 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
 
     if api_key:
         try:
+            from google import genai
             client = genai.Client(api_key=api_key)
             prompt = f"""
-            You are a quantitative trading engine analyzing Kronos-small ({stats['total_paths']} Monte Carlo candlestick futures).
+            You are a quantitative trading engine analyzing Kronos ({stats['total_paths']} Monte Carlo candlestick futures).
             Asset: {symbol} ({interval}) | Last Close: {last_c} | ATR(14): {atr:.4f}
             Regime: {stats['regime']} ({stats['paths_up']}/{stats['total_paths']} paths up)
             Lowest p10 dip across 24 bars: {p10_path_min:.2f} | Highest p90 peak: {p90_path_max:.2f}
@@ -308,15 +320,20 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
               "target": <number>
             }}
             """
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            ai_plan = json.loads(resp.text)
-            plan["entry"] = round(float(ai_plan.get("entry", default_entry)), 2)
-            plan["stop_loss"] = round(float(ai_plan.get("stop_loss", default_stop)), 2)
-            plan["target"] = round(float(ai_plan.get("target", default_target)), 2)
+            for model_id in ["gemini-3.8-flash", "gemini-2.5-flash"]:
+                try:
+                    resp = client.models.generate_content(
+                        model=model_id,
+                        contents=prompt,
+                        config={"response_mime_type": "application/json"}
+                    )
+                    ai_plan = json.loads(resp.text)
+                    plan["entry"] = round(float(ai_plan.get("entry", default_entry)), 2)
+                    plan["stop_loss"] = round(float(ai_plan.get("stop_loss", default_stop)), 2)
+                    plan["target"] = round(float(ai_plan.get("target", default_target)), 2)
+                    break
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -345,7 +362,12 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
     return plan
 
 
-def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, paths_matrix: np.ndarray, stats: dict, plan: dict) -> io.BytesIO:
+def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stats: dict, plan: dict) -> io.BytesIO:
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     with INFER_LOCK:
         plt.style.use("dark_background")
         fig, ax = plt.subplots(figsize=(9, 4.5), dpi=120)
@@ -360,7 +382,7 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
 
         last_close = hist_closes[-1]
         for path in paths_matrix:
-            ax.plot(fut_x, np.concatenate([[last_close], path]), color="#94a3b8", alpha=0.12, linewidth=0.8)
+            ax.plot(fut_x, np.concatenate([[last_close], path]), color="#94a3b8", alpha=0.14, linewidth=0.8)
 
         ax.plot(fut_x, np.concatenate([[last_close], stats["p90_path"]]), color="#38bdf8", linestyle="--", linewidth=1.8, label="p90 (Upper)")
         ax.plot(fut_x, np.concatenate([[last_close], stats["median_path"]]), color="#facc15", linewidth=2.4, label="Median Forecast")
@@ -383,9 +405,10 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
 
 
 # ==============================================================================
-# 3. TELEGRAM MESSAGE PROCESSOR (Shared by Webhook & Fallback Polling)
+# 3. TELEGRAM MESSAGE HANDLER (Zero Silent Lockouts + Live Progress Updates)
 # ==============================================================================
 def process_telegram_update(item: dict):
+    global LAST_EVENT
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     msg = item.get("message") or item.get("edited_message") or {}
     text = (msg.get("text") or "").strip()
@@ -394,14 +417,18 @@ def process_telegram_update(item: dict):
     if not text or not chat_id:
         return
 
-    if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
-        print(f"⚠️ Ignored message from chat_id {chat_id} (expected TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID})", flush=True)
-        return
+    LAST_EVENT = f"Received '{text}' from chat_id={chat_id} at {time.strftime('%H:%M:%S UTC')}"
+    print(f"📩 {LAST_EVENT}", flush=True)
 
-    if text.lower() in ["/start", "help", "/help"]:
+    # Instant zero-memory response for /start or help commands
+    if text.lower() in ["/", "/start", "start", "/help", "help", "/ping", "ping"]:
         requests.post(f"{base_url}/sendMessage", json={
             "chat_id": chat_id,
-            "text": "📈 <b>Bot is Awake!</b> Send a ticker + timeframe (e.g. <code>NVDA 15m</code>, <code>SHFS 15m</code>, <code>BTCUSDT 1h</code>).",
+            "text": (
+                f"🟢 <b>Hasani-Bot is Awake & Connected!</b>\n"
+                f"• <b>Your Chat ID:</b> <code>{chat_id}</code>\n"
+                f"• <b>Send any ticker:</b> <code>NVDA 15m</code>, <code>SHFS 15m</code>, or <code>BTCUSDT 1h</code>"
+            ),
             "parse_mode": "HTML"
         }, timeout=15)
         return
@@ -426,18 +453,37 @@ def process_telegram_update(item: dict):
     else:
         req_interval = raw_tf if raw_tf in valid_crypto_tf else DEFAULT_INTERVAL
 
-    cold_note = " <i>(first run after sleep — loading model ~20s)</i>" if PREDICTOR is None else ""
-    print(f"📩 Processing {req_symbol} ({req_interval}) for chat {chat_id}...", flush=True)
-    requests.post(f"{base_url}/sendMessage", json={
+    # Step 1: Immediate reply BEFORE importing heavy ML libraries
+    step_resp = requests.post(f"{base_url}/sendMessage", json={
         "chat_id": chat_id,
-        "text": f"⏳ Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}{cold_note}",
+        "text": f"⏳ <b>[1/3]</b> Fetching candles for <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}",
         "parse_mode": "HTML"
-    }, timeout=15)
+    }, timeout=15).json()
+    status_msg_id = step_resp.get("result", {}).get("message_id")
+
+    def update_progress(html_text: str):
+        if status_msg_id:
+            try:
+                requests.post(f"{base_url}/editMessageText", json={
+                    "chat_id": chat_id,
+                    "message_id": status_msg_id,
+                    "text": html_text,
+                    "parse_mode": "HTML"
+                }, timeout=10)
+            except Exception:
+                pass
 
     try:
+        import numpy as np
         df = fetch_candles(req_symbol, req_interval, LOOKBACK, req_source)
+
+        cold_hint = " <i>(first run loads model ~15s)</i>" if PREDICTOR is None else ""
+        update_progress(f"🧠 <b>[2/3]</b> Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{cold_hint}")
+
         _, paths_matrix = run_kronos_forecast(df, PRED_LEN, SAMPLE_COUNT)
         stats = analyze_paths(df, paths_matrix)
+
+        update_progress(f"📊 <b>[3/3]</b> Building Gemini 3.8 trade plan & chart for <b>{req_symbol}</b>...")
         backtest = run_backtest_with_fees(req_symbol, req_interval, req_source)
         plan = build_verified_trade_plan(req_symbol, req_interval, df, stats, backtest, GEMINI_API_KEY)
 
@@ -461,9 +507,16 @@ def process_telegram_update(item: dict):
             files={"photo": ("forecast.png", chart_buf, "image/png")},
             timeout=30
         )
-        print(f"✅ Sent {req_symbol} forecast to Telegram!", flush=True)
+
+        if status_msg_id:
+            requests.post(f"{base_url}/deleteMessage", json={"chat_id": chat_id, "message_id": status_msg_id}, timeout=10)
+
+        LAST_EVENT = f"✅ Sent {req_symbol} ({req_interval}) forecast to chat_id={chat_id}"
+        print(LAST_EVENT, flush=True)
+
     except Exception as err:
-        print(f"❌ Error on {req_symbol}: {err}", flush=True)
+        LAST_EVENT = f"❌ Error on {req_symbol}: {err}"
+        print(traceback.format_exc(), flush=True)
         requests.post(f"{base_url}/sendMessage", json={
             "chat_id": chat_id,
             "text": f"❌ Could not analyze <code>{req_symbol}</code> ({req_interval}): {err}",
@@ -484,20 +537,14 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        tok_ok = "✅ Configured" if TELEGRAM_BOT_TOKEN else "❌ MISSING (Add in Render -> Environment)"
-        cid_ok = f"✅ Configured ({TELEGRAM_CHAT_ID})" if TELEGRAM_CHAT_ID else "⚠️ Not set (accepting any chat)"
-        gem_ok = "✅ Configured" if GEMINI_API_KEY else "⚠️ Not set (using ATR statistical rules)"
-        url_ok = RENDER_EXTERNAL_URL or "Local / Polling Mode"
-
         html = (
-            "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;line-height:1.7;'>"
-            "<h2>📈 Kronos + Gemini Render Diagnostic Dashboard</h2>"
-            f"<div><b>Telegram Bot Status:</b> {BOT_STATUS}</div>"
-            f"<div><b>Kronos Model Status:</b> {MODEL_STATUS}</div><hr style='border-color:#1f2937;'>"
-            f"<div><b>TELEGRAM_BOT_TOKEN:</b> {tok_ok}</div>"
-            f"<div><b>TELEGRAM_CHAT_ID:</b> {cid_ok}</div>"
-            f"<div><b>GEMINI_API_KEY:</b> {gem_ok}</div>"
-            f"<div><b>Render Public URL:</b> {url_ok}</div>"
+            "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;line-height:1.8;'>"
+            "<h2>📈 Hasani-Bot Live Diagnostic Page</h2>"
+            f"<div><b>Telegram Status:</b> {BOT_STATUS}</div>"
+            f"<div><b>Kronos Status:</b> {MODEL_STATUS}</div>"
+            f"<div><b>Last Event:</b> {LAST_EVENT}</div><hr style='border-color:#1f2937;'>"
+            f"<div><b>Parsed TELEGRAM_CHAT_ID:</b> {TELEGRAM_CHAT_ID or 'Not set (replies to all chats)'}</div>"
+            f"<div><b>GEMINI_API_KEY:</b> {'✅ Configured' if GEMINI_API_KEY else '⚠️ Not set (using ATR rules)'}</div>"
             "</body></html>"
         )
         self.wfile.write(html.encode("utf-8"))
@@ -531,11 +578,10 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         return
 
 
-def startup_telegram_and_model():
+def startup_telegram():
     global BOT_STATUS
     if not TELEGRAM_BOT_TOKEN:
         BOT_STATUS = "❌ TELEGRAM_BOT_TOKEN is missing in Render -> Environment!"
-        print(BOT_STATUS, flush=True)
         return
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -543,48 +589,34 @@ def startup_telegram_and_model():
         me = requests.get(f"{base_url}/getMe", timeout=15).json()
         if not me.get("ok"):
             BOT_STATUS = f"❌ Invalid TELEGRAM_BOT_TOKEN: {me.get('description')}"
-            print(BOT_STATUS, flush=True)
             return
         bot_username = me["result"].get("username", "Bot")
     except Exception as e:
-        BOT_STATUS = f"❌ Could not reach Telegram API: {e}"
-        print(BOT_STATUS, flush=True)
+        BOT_STATUS = f"❌ Telegram connection error: {e}"
         return
 
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        wh = requests.post(f"{base_url}/setWebhook", json={"url": webhook_url}, timeout=15).json()
-        if wh.get("ok"):
-            BOT_STATUS = f"🟢 Webhook Active (@{bot_username} -> {webhook_url})"
-        else:
-            BOT_STATUS = f"⚠️ Webhook setup error: {wh}"
-        print(BOT_STATUS, flush=True)
-
-        if TELEGRAM_CHAT_ID:
-            requests.post(f"{base_url}/sendMessage", json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": (
-                    f"☁️ <b>@{bot_username} is LIVE on Render (Webhook Mode)!</b>\n"
-                    f"Even if Render sleeps, texting me will wake it up automatically.\n"
-                    f"Try sending <code>NVDA 15m</code> or <code>SHFS 15m</code>!"
-                ),
-                "parse_mode": "HTML"
-            }, timeout=15)
-
-        # Preload Kronos in background after Telegram is already live
-        try:
-            ensure_kronos_loaded()
-        except Exception as e:
-            print(f"⚠️ Background preload error: { traceback.format_exc() }", flush=True)
+    webhook_url = f"{RENDER_EXTERNAL_URL or 'https://hasani-bot.onrender.com'}/webhook"
+    wh = requests.post(f"{base_url}/setWebhook", json={"url": webhook_url}, timeout=15).json()
+    if wh.get("ok"):
+        BOT_STATUS = f"🟢 Webhook Active on @{bot_username} ({webhook_url})"
     else:
-        # Local fallback if not on Render
-        requests.get(f"{base_url}/deleteWebhook", timeout=10)
-        BOT_STATUS = f"🟢 Polling Active (@{bot_username})"
-        ensure_kronos_loaded()
+        BOT_STATUS = f"⚠️ Webhook error: {wh}"
+
+    if TELEGRAM_CHAT_ID:
+        r = requests.post(f"{base_url}/sendMessage", json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": (
+                f"☁️ <b>@{bot_username} is LIVE on Render!</b>\n"
+                f"Send <code>/start</code> or <code>NVDA 15m</code> now to test."
+            ),
+            "parse_mode": "HTML"
+        }, timeout=15).json()
+        if not r.get("ok"):
+            BOT_STATUS += f" | ⚠️ Startup message note: {r.get('description')}"
 
 
 if __name__ == "__main__":
-    threading.Thread(target=startup_telegram_and_model, daemon=True).start()
+    threading.Thread(target=startup_telegram, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     print(f"🌐 Server listening on 0.0.0.0:{port}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), BotHTTPHandler).serve_forever()
