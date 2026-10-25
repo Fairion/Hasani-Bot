@@ -1,5 +1,4 @@
 import os
-# Limit glibc memory arenas BEFORE importing numpy/torch to prevent RAM fragmentation on Render 512MB
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -47,7 +46,6 @@ LAST_EVENT   = "None yet"
 
 
 def free_memory():
-    """Forces Python GC and returns unused Linux heap pages back to OS (<512 MB guard)."""
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -67,7 +65,7 @@ def get_ram_mb() -> float:
 
 
 # ==============================================================================
-# 1. CPU-OPTIMIZED KRONOS-MINI LOADER (~220 MB Total Process RAM)
+# 1. CPU-OPTIMIZED KRONOS-MINI LOADER (<260 MB Total RAM)
 # ==============================================================================
 def ensure_kronos_loaded():
     global PREDICTOR, MODEL_STATUS
@@ -108,7 +106,6 @@ def ensure_kronos_loaded():
         from model import Kronos, KronosTokenizer, KronosPredictor
 
         MODEL_STATUS = f"⚡ Loading Kronos-mini on CPU (torch {torch.__version__})..."
-        print(f"{MODEL_STATUS} | RAM before load: {get_ram_mb()} MB", flush=True)
         tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k")
         model = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
         model.eval()
@@ -116,16 +113,16 @@ def ensure_kronos_loaded():
         free_memory()
 
         MODEL_STATUS = f"✅ Kronos-mini Ready (RAM: {get_ram_mb()} MB / 512 MB)"
-        print(MODEL_STATUS, flush=True)
         return PREDICTOR
 
 
 # ==============================================================================
-# 2. ZERO-OVERHEAD YAHOO FINANCE + BINANCE FETCHER (Supports 4h Stocks!)
+# 2. CANDLE FETCHER (yfinance with Chrome TLS + 4h Stock Resampling + Binance)
 # ==============================================================================
-def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 160, source: str = "stocks"):
+def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 500, source: str = "stocks"):
     import numpy as np
     import pandas as pd
+    import yfinance as yf
 
     symbol = symbol.strip().upper()
     if source == "binance":
@@ -156,7 +153,6 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 160, sourc
         df["amount"] = df["quote_volume"]
         return df[["timestamps", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
 
-    # Direct Yahoo Finance v8 JSON API (saves ~100 MB RAM vs importing yfinance)
     resample_4h = (interval == "4h")
     yf_interval_map = {
         "1m": ("1m", "7d"),
@@ -165,40 +161,22 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 160, sourc
         "15m": ("15m", "60d"),
         "30m": ("30m", "60d"),
         "1h": ("60m", "60d"),
-        "4h": ("60m", "1y"),   # Fetch 1h bars over 1 year and aggregate into 4h bars
+        "4h": ("60m", "730d"),  # Fetch 1h candles and aggregate into 4h candles
         "1d": ("1d", "2y"),
     }
-    yf_int, yf_range = yf_interval_map.get(interval, ("15m", "60d"))
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    yf_int, period = yf_interval_map.get(interval, ("15m", "60d"))
 
-    payload = None
-    for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
-        try:
-            url = f"https://{host}/v8/finance/chart/{symbol}"
-            r = requests.get(url, params={"interval": yf_int, "range": yf_range}, headers=headers, timeout=12)
-            if r.status_code == 200:
-                payload = r.json()
-                break
-        except Exception:
-            continue
+    df = yf.Ticker(symbol).history(period=period, interval=yf_int)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if df.empty or len(df) < 10:
+        raise ValueError(f"Not enough stock data returned for '{symbol}' on {interval}.")
 
-    if not payload or not payload.get("chart", {}).get("result"):
-        raise ValueError(f"Ticker '{symbol}' not found on Yahoo Finance.")
-
-    res = payload["chart"]["result"][0]
-    ts_list = res.get("timestamp")
-    quote = res.get("indicators", {}).get("quote", [{}])[0]
-    if not ts_list or not quote.get("close"):
-        raise ValueError(f"No candle data returned for '{symbol}' ({interval}).")
-
-    df = pd.DataFrame({
-        "timestamps": pd.to_datetime(ts_list, unit="s"),
-        "open": pd.to_numeric(quote.get("open"), errors="coerce"),
-        "high": pd.to_numeric(quote.get("high"), errors="coerce"),
-        "low": pd.to_numeric(quote.get("low"), errors="coerce"),
-        "close": pd.to_numeric(quote.get("close"), errors="coerce"),
-        "volume": pd.to_numeric(quote.get("volume"), errors="coerce").fillna(0.0),
-    }).dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    df = df.reset_index()
+    time_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df["timestamps"] = pd.to_datetime(df[time_col]).dt.tz_localize(None)
+    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+    df = df[["timestamps", "open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
 
     if resample_4h and len(df) >= 40:
         df["grp"] = np.arange(len(df)) // 4
@@ -210,9 +188,6 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 160, sourc
             "close": "last",
             "volume": "sum"
         })
-
-    if len(df) < 10:
-        raise ValueError(f"Not enough historical bars ({len(df)}) for '{symbol}' on {interval}.")
 
     df = df.tail(lookback).reset_index(drop=True)
     df["amount"] = df["close"] * df["volume"]
@@ -240,7 +215,6 @@ def run_kronos_forecast(df, pred_len: int = 24, sample_count: int = 25):
     all_paths_close = []
     with INFER_LOCK, torch.inference_mode():
         try:
-            # Tiny batch size (5) keeps CPU activation RAM < 15 MB
             batch_size = 5
             remaining = sample_count
             while remaining > 0:
@@ -311,9 +285,8 @@ def analyze_paths(df, paths_matrix) -> dict:
     }
 
 
-def run_backtest_with_fees(symbol: str, interval: str, source: str, fee_bps: float = 10.0, slippage_bps: float = 5.0) -> dict:
+def run_backtest_with_fees(df_hist, fee_bps: float = 10.0, slippage_bps: float = 5.0) -> dict:
     import numpy as np
-    df_hist = fetch_candles(symbol, interval=interval, lookback=500, source=source)
     closes = df_hist["close"].values
     round_trip_cost = 2.0 * ((fee_bps + slippage_bps) / 10000.0)
     trades = []
@@ -395,7 +368,7 @@ def build_verified_trade_plan(symbol: str, interval: str, df, stats: dict, backt
               "target": <number>
             }}
             """
-            for model_id in ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
+            for model_id in ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]:
                 try:
                     resp = client.models.generate_content(
                         model=model_id,
@@ -438,7 +411,7 @@ def build_verified_trade_plan(symbol: str, interval: str, df, stats: dict, backt
 
 
 # ==============================================================================
-# 4. ULTRA-LIGHTWEIGHT PILLOW CHART RENDERER (~6 MB RAM vs 85 MB Matplotlib)
+# 4. ULTRA-LIGHTWEIGHT PILLOW CHART RENDERER (~6 MB RAM)
 # ==============================================================================
 def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stats: dict, plan: dict) -> io.BytesIO:
     import numpy as np
@@ -479,7 +452,6 @@ def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stat
         y = PAD_T + (1.0 - (val - y_min) / (y_max - y_min)) * plot_h
         return (round(x, 1), round(y, 1))
 
-    # Grid & right-side price scale
     for i in range(6):
         frac = i / 5.0
         gy = round(PAD_T + frac * plot_h)
@@ -490,7 +462,6 @@ def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stat
     split_x, _ = to_xy(len(hist_closes) - 1, last_close)
     draw.line([(split_x, PAD_T), (split_x, H - PAD_B)], fill=(55, 65, 81, 255), width=1)
 
-    # Semi-transparent Monte Carlo fan paths
     fan_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     fan_draw = ImageDraw.Draw(fan_layer)
     start_idx = len(hist_closes) - 1
@@ -501,7 +472,6 @@ def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stat
     base = Image.alpha_composite(base, fan_layer)
     draw = ImageDraw.Draw(base)
 
-    # Historical Close, p90, Median, p10
     hist_pts = [to_xy(i, float(v)) for i, v in enumerate(hist_closes)]
     draw.line(hist_pts, fill=(16, 185, 129, 255), width=3)
 
@@ -513,13 +483,11 @@ def create_telegram_chart_png(symbol: str, interval: str, df, paths_matrix, stat
     draw.line(p10_pts, fill=(248, 113, 113, 255), width=2)
     draw.line(med_pts, fill=(250, 204, 21, 255), width=3)
 
-    # Stop & Target dashed lines
     for level, color in [(plan["stop_loss"], (239, 68, 68, 255)), (plan["target"], (34, 197, 94, 255))]:
         _, ly = to_xy(start_idx, level)
         for seg_x in range(int(split_x), W - PAD_R, 12):
             draw.line([(seg_x, ly), (min(seg_x + 6, W - PAD_R), ly)], fill=color, width=2)
 
-    # Header & Legend
     draw.text((PAD_L, 16), f"KRONOS FORECAST: {symbol} ({interval})  |  {stats['regime']} ({stats['paths_up']}/{stats['total_paths']} up)", fill=(255, 255, 255, 255), font=font_title)
     legend_box = (PAD_L + 8, PAD_T + 8, PAD_L + 225, PAD_T + 108)
     draw.rectangle(legend_box, fill=(17, 24, 39, 220), outline=(55, 65, 81, 255))
@@ -562,9 +530,9 @@ def process_telegram_update(item: dict):
         requests.post(f"{base_url}/sendMessage", json={
             "chat_id": chat_id,
             "text": (
-                f"🟢 <b>Hasani-Bot is Awake & Memory-Optimized!</b>\n"
+                f"🟢 <b>Hasani-Bot v3 is Awake!</b>\n"
                 f"• <b>RAM Usage:</b> <code>{get_ram_mb()} MB / 512 MB</code>\n"
-                f"• <b>Try sending:</b> <code>NVDA 4h</code>, <code>NVDA 15m</code>, <code>SHFS 15m</code>, or <code>BTCUSDT 1h</code>"
+                f"• <b>Send any ticker:</b> <code>NVDA 4h</code>, <code>NVDA 15m</code>, <code>SHFS 15m</code>, or <code>BTCUSDT 1h</code>"
             ),
             "parse_mode": "HTML"
         }, timeout=15)
@@ -611,7 +579,9 @@ def process_telegram_update(item: dict):
 
     try:
         import numpy as np
-        df = fetch_candles(req_symbol, req_interval, LOOKBACK, req_source)
+        # Fetch 500 bars once for both backtest and forecast
+        df_full = fetch_candles(req_symbol, req_interval, 500, req_source)
+        df = df_full.tail(LOOKBACK).reset_index(drop=True)
 
         cold_hint = " <i>(loading CPU model ~12s)</i>" if PREDICTOR is None else ""
         update_progress(f"🧠 <b>[2/3]</b> Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{cold_hint}")
@@ -619,8 +589,8 @@ def process_telegram_update(item: dict):
         _, paths_matrix = run_kronos_forecast(df, PRED_LEN, SAMPLE_COUNT)
         stats = analyze_paths(df, paths_matrix)
 
-        update_progress(f"📊 <b>[3/3]</b> Building Gemini trade plan & chart for <b>{req_symbol}</b>...")
-        backtest = run_backtest_with_fees(req_symbol, req_interval, req_source)
+        update_progress(f"📊 <b>[3/3]</b> Building Gemini 3.8 trade plan & chart for <b>{req_symbol}</b>...")
+        backtest = run_backtest_with_fees(df_full)
         plan = build_verified_trade_plan(req_symbol, req_interval, df, stats, backtest, GEMINI_API_KEY)
 
         p10_min = float(np.min(stats["p10_path"]))
@@ -672,7 +642,7 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         html = (
             "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;line-height:1.8;'>"
-            "<h2>📈 Hasani-Bot Live Diagnostic Page</h2>"
+            "<h2>📈 Hasani-Bot v3 Live Diagnostic Page</h2>"
             f"<div><b>Telegram Status:</b> {BOT_STATUS}</div>"
             f"<div><b>Kronos Status:</b> {MODEL_STATUS}</div>"
             f"<div><b>Live RAM Usage:</b> {get_ram_mb()} MB / 512 MB</div>"
@@ -735,8 +705,8 @@ def startup_telegram():
         requests.post(f"{base_url}/sendMessage", json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": (
-                f"☁️ <b>@{bot_username} is LIVE (<250 MB RAM Mode)!</b>\n"
-                f"Send <code>NVDA 4h</code> or <code>NVDA 15m</code> now to test."
+                f"☁️ <b>@{bot_username} is LIVE (v3 — Ready!)</b>\n"
+                f"Send <code>NVDA 4h</code>, <code>NVDA 1h</code>, or <code>NVDA 15m</code> now!"
             ),
             "parse_mode": "HTML"
         }, timeout=15)
