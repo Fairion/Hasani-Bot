@@ -1,5 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch==2.7.1+cpu
 einops
 huggingface_hub
 safetensors
@@ -7,6 +8,5 @@ tqdm
 numpy
 pandas
 requests
-yfinance
 google-genai
-matplotlib
+pillow
