@@ -8,5 +8,6 @@ tqdm
 numpy
 pandas
 requests
+yfinance
 google-genai
 pillow
