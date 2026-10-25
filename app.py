@@ -4,7 +4,6 @@ import io
 import gc
 import json
 import time
-import zipfile
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,100 +18,81 @@ import yfinance as yf
 from google import genai
 
 # ==============================================================================
-# CONFIGURATION & RENDER FREE-TIER MEMORY SETTINGS
+# AUTO-CLEAN ENVIRONMENT VARIABLES (Strips accidental quotes & spaces)
 # ==============================================================================
-DEFAULT_INTERVAL   = "15m"
-LOOKBACK           = int(os.environ.get("LOOKBACK", "256"))      # 256 candles keeps RAM safely < 512 MB
-PRED_LEN           = int(os.environ.get("PRED_LEN", "24"))
-SAMPLE_COUNT       = int(os.environ.get("SAMPLE_COUNT", "30"))   # 30 Monte Carlo paths for fast 0.1-CPU replies
+def clean_env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip().strip('"').strip("'")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
+DEFAULT_INTERVAL    = "15m"
+LOOKBACK            = int(clean_env("LOOKBACK", "256"))
+PRED_LEN            = int(clean_env("PRED_LEN", "24"))
+SAMPLE_COUNT        = int(clean_env("SAMPLE_COUNT", "30"))
 
-MODEL_LOCK = threading.Lock()
-PREDICTOR  = None
-BOT_STATUS = "⏳ Booting container & downloading Kronos-small in background..."
+TELEGRAM_BOT_TOKEN  = clean_env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID    = clean_env("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY      = clean_env("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = clean_env("RENDER_EXTERNAL_URL").rstrip("/")
 
+LOAD_LOCK         = threading.Lock()
+INFER_LOCK        = threading.Lock()
+PREDICTOR         = None
+PROCESSED_UPDATES = set()
 
-# ==============================================================================
-# 1. INSTANT HEALTH-CHECK SERVER (Satisfies Render Port Scan Immediately)
-# ==============================================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        html = (
-            "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;'>"
-            "<h2>📈 Kronos + Gemini Telegram Bot (Render Cloud)</h2>"
-            f"<p><b>Status:</b> {BOT_STATUS}</p>"
-            f"<p><b>Settings:</b> Lookback={LOOKBACK} | Horizon={PRED_LEN} | Samples={SAMPLE_COUNT}</p>"
-            "</body></html>"
-        )
-        self.wfile.write(html.encode("utf-8"))
-
-    def log_message(self, format, *args):
-        return  # Keep Render logs clean
+BOT_STATUS   = "⏳ Connecting to Telegram..."
+MODEL_STATUS = "⏳ Waiting to preload Kronos-small..."
 
 
 # ==============================================================================
-# 2. PURE-PYTHON KRONOS LOADER (No git binary required, <512 MB RAM safe)
+# 1. ULTRA-LIGHTWEIGHT KRONOS LOADER (Downloads only 3 .py files = ~25 KB)
 # ==============================================================================
-def load_kronos_predictor():
-    global PREDICTOR, BOT_STATUS
-    import torch
-    torch.set_grad_enabled(False)
-    torch.set_num_threads(2)
+def ensure_kronos_loaded():
+    global PREDICTOR, MODEL_STATUS
+    if PREDICTOR is not None:
+        return PREDICTOR
 
-    target_base = "/tmp/kronos_repo"
-    os.makedirs(target_base, exist_ok=True)
-    repo_dir = None
+    with LOAD_LOCK:
+        if PREDICTOR is not None:
+            return PREDICTOR
 
-    for name in os.listdir(target_base):
-        candidate = os.path.join(target_base, name)
-        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "model")):
-            repo_dir = candidate
-            break
+        import torch
+        torch.set_grad_enabled(False)
+        torch.set_num_threads(2)
 
-    if not repo_dir:
-        BOT_STATUS = "📦 Downloading shiyu-coder/Kronos source archive..."
-        print(BOT_STATUS, flush=True)
-        resp = requests.get("https://github.com/shiyu-coder/Kronos/archive/HEAD.zip", timeout=30)
-        resp.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            zf.extractall(target_base)
-        for name in os.listdir(target_base):
-            candidate = os.path.join(target_base, name)
-            if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "model")):
-                repo_dir = candidate
-                break
+        pkg_root = "/tmp/kronos_pkg"
+        model_dir = os.path.join(pkg_root, "model")
+        os.makedirs(model_dir, exist_ok=True)
 
-    if not repo_dir:
-        raise RuntimeError("Could not locate Kronos 'model' folder after extraction.")
+        MODEL_STATUS = "📦 Fetching Kronos model scripts (25 KB)..."
+        print(MODEL_STATUS, flush=True)
+        raw_base = "https://raw.githubusercontent.com/shiyu-coder/Kronos/master/model"
+        for fname in ["__init__.py", "module.py", "kronos.py"]:
+            fpath = os.path.join(model_dir, fname)
+            if not os.path.exists(fpath):
+                r = requests.get(f"{raw_base}/{fname}", timeout=20)
+                r.raise_for_status()
+                with open(fpath, "wb") as f:
+                    f.write(r.content)
 
-    if repo_dir not in sys.path:
-        sys.path.insert(0, repo_dir)
+        if pkg_root not in sys.path:
+            sys.path.insert(0, pkg_root)
 
-    from model import Kronos, KronosTokenizer, KronosPredictor
+        from model import Kronos, KronosTokenizer, KronosPredictor
 
-    BOT_STATUS = "⚡ Loading NeoQuasar/Kronos-small weights on CPU..."
-    print(BOT_STATUS, flush=True)
-    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-    model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-    model.eval()
-    PREDICTOR = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
-    gc.collect()
-    print("✅ Kronos-small loaded successfully!", flush=True)
+        MODEL_STATUS = "⚡ Loading NeoQuasar/Kronos-small on CPU..."
+        print(MODEL_STATUS, flush=True)
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+        model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+        model.eval()
+        PREDICTOR = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+        gc.collect()
+
+        MODEL_STATUS = "✅ Kronos-small Loaded & Ready"
+        print(MODEL_STATUS, flush=True)
+        return PREDICTOR
 
 
 # ==============================================================================
-# 3. CORE FORECASTING, BACKTEST & VERIFIED STOP-LOSS ENGINE
+# 2. CORE FORECASTING, BACKTEST & VERIFIED STOP-LOSS ENGINE
 # ==============================================================================
 def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, source: str = "stocks") -> pd.DataFrame:
     symbol = symbol.strip().upper()
@@ -164,7 +144,9 @@ def fetch_candles(symbol: str, interval: str = "15m", lookback: int = 256, sourc
 
 
 def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int = 30):
+    predictor = ensure_kronos_loaded()
     import torch
+
     time_delta = df["timestamps"].diff().median()
     if pd.isna(time_delta) or time_delta.total_seconds() <= 0:
         time_delta = pd.Timedelta(minutes=15)
@@ -174,14 +156,13 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
     x_timestamp = df["timestamps"]
 
     all_paths_close = []
-    with MODEL_LOCK, torch.inference_mode():
+    with INFER_LOCK, torch.inference_mode():
         try:
-            # Small batch size (5) prevents 512 MB RAM spikes on Render Free Tier
             batch_size = 5
             remaining = sample_count
             while remaining > 0:
                 cur_batch = min(batch_size, remaining)
-                preds = PREDICTOR.predict_batch(
+                preds = predictor.predict_batch(
                     df_list=[x_df for _ in range(cur_batch)],
                     x_timestamp_list=[x_timestamp for _ in range(cur_batch)],
                     y_timestamp_list=[future_timestamps for _ in range(cur_batch)],
@@ -197,7 +178,7 @@ def run_kronos_forecast(df: pd.DataFrame, pred_len: int = 24, sample_count: int 
         except Exception:
             all_paths_close = []
             for _ in range(sample_count):
-                pred_df = PREDICTOR.predict(
+                pred_df = predictor.predict(
                     df=x_df,
                     x_timestamp=x_timestamp,
                     y_timestamp=future_timestamps,
@@ -365,7 +346,7 @@ def build_verified_trade_plan(symbol: str, interval: str, df: pd.DataFrame, stat
 
 
 def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, paths_matrix: np.ndarray, stats: dict, plan: dict) -> io.BytesIO:
-    with MODEL_LOCK:
+    with INFER_LOCK:
         plt.style.use("dark_background")
         fig, ax = plt.subplots(figsize=(9, 4.5), dpi=120)
         fig.patch.set_facecolor("#0b0e14")
@@ -402,154 +383,208 @@ def create_telegram_chart_png(symbol: str, interval: str, df: pd.DataFrame, path
 
 
 # ==============================================================================
-# 4. BACKGROUND MODEL BOOTSTRAP + 24/7 TELEGRAM LISTENER
+# 3. TELEGRAM MESSAGE PROCESSOR (Shared by Webhook & Fallback Polling)
 # ==============================================================================
-def bootstrap_and_run_bot():
-    global BOT_STATUS
-    try:
-        load_kronos_predictor()
-    except Exception as e:
-        BOT_STATUS = f"❌ Model load error: {e}"
-        print(traceback.format_exc(), flush=True)
+def process_telegram_update(item: dict):
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    msg = item.get("message") or item.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
+    chat_id = msg.get("chat", {}).get("id")
+
+    if not text or not chat_id:
         return
 
+    if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
+        print(f"⚠️ Ignored message from chat_id {chat_id} (expected TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID})", flush=True)
+        return
+
+    if text.lower() in ["/start", "help", "/help"]:
+        requests.post(f"{base_url}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": "📈 <b>Bot is Awake!</b> Send a ticker + timeframe (e.g. <code>NVDA 15m</code>, <code>SHFS 15m</code>, <code>BTCUSDT 1h</code>).",
+            "parse_mode": "HTML"
+        }, timeout=15)
+        return
+
+    valid_stock_tf = {"1m", "2m", "5m", "15m", "30m", "1h", "1d"}
+    valid_crypto_tf = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
+
+    parts = text.upper().split()
+    req_symbol = parts[0].replace("/", "").lstrip("$")
+    raw_tf = parts[1].lower() if len(parts) > 1 else DEFAULT_INTERVAL
+    req_source = "binance" if req_symbol.endswith(("USDT", "USDC", "BUSD")) else "stocks"
+
+    tf_note = ""
+    if req_source == "stocks":
+        if raw_tf == "3m":
+            req_interval = "5m"
+            tf_note = " <i>(switched 3m &rarr; 5m for Yahoo Finance)</i>"
+        elif raw_tf in valid_stock_tf:
+            req_interval = raw_tf
+        else:
+            req_interval = DEFAULT_INTERVAL
+    else:
+        req_interval = raw_tf if raw_tf in valid_crypto_tf else DEFAULT_INTERVAL
+
+    cold_note = " <i>(first run after sleep — loading model ~20s)</i>" if PREDICTOR is None else ""
+    print(f"📩 Processing {req_symbol} ({req_interval}) for chat {chat_id}...", flush=True)
+    requests.post(f"{base_url}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": f"⏳ Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}{cold_note}",
+        "parse_mode": "HTML"
+    }, timeout=15)
+
+    try:
+        df = fetch_candles(req_symbol, req_interval, LOOKBACK, req_source)
+        _, paths_matrix = run_kronos_forecast(df, PRED_LEN, SAMPLE_COUNT)
+        stats = analyze_paths(df, paths_matrix)
+        backtest = run_backtest_with_fees(req_symbol, req_interval, req_source)
+        plan = build_verified_trade_plan(req_symbol, req_interval, df, stats, backtest, GEMINI_API_KEY)
+
+        p10_min = float(np.min(stats["p10_path"]))
+        caption = (
+            f"📊 <b>KRONOS + GEMINI: {req_symbol} ({req_interval})</b>\n"
+            f"• <b>Last Close:</b> <code>{stats['last_close']:,.2f}</code>\n"
+            f"• <b>Regime:</b> <code>{stats['regime']}</code> ({stats['paths_up']}/{stats['total_paths']} paths up)\n"
+            f"• <b>Median (+{PRED_LEN} bars):</b> <code>{stats['median_final']:,.2f}</code>\n"
+            f"• <b>24-Bar p10 – p90:</b> <code>{stats['p10_final']:,.2f}</code> – <code>{stats['p90_final']:,.2f}</code>\n"
+            f"• <b>Max Path Pullback (p10 low):</b> <code>{p10_min:,.2f}</code>\n"
+            f"• <b>Backtest (net fees):</b> <code>{backtest['win_rate_pct']}% win</code> (<code>{backtest['net_return_pct']}% net</code>)\n\n"
+            f"🎯 <b>Plan:</b> {plan['summary']}\n"
+            f"<code>Entry: {plan['entry']:,.2f} | Stop: {plan['stop_loss']:,.2f} | Target: {plan['target']:,.2f}</code>"
+        )
+
+        chart_buf = create_telegram_chart_png(req_symbol, req_interval, df, paths_matrix, stats, plan)
+        requests.post(
+            f"{base_url}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("forecast.png", chart_buf, "image/png")},
+            timeout=30
+        )
+        print(f"✅ Sent {req_symbol} forecast to Telegram!", flush=True)
+    except Exception as err:
+        print(f"❌ Error on {req_symbol}: {err}", flush=True)
+        requests.post(f"{base_url}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": f"❌ Could not analyze <code>{req_symbol}</code> ({req_interval}): {err}",
+            "parse_mode": "HTML"
+        }, timeout=15)
+
+
+# ==============================================================================
+# 4. WEBHOOK + LIVE DIAGNOSTIC HTTP SERVER
+# ==============================================================================
+class BotHTTPHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        tok_ok = "✅ Configured" if TELEGRAM_BOT_TOKEN else "❌ MISSING (Add in Render -> Environment)"
+        cid_ok = f"✅ Configured ({TELEGRAM_CHAT_ID})" if TELEGRAM_CHAT_ID else "⚠️ Not set (accepting any chat)"
+        gem_ok = "✅ Configured" if GEMINI_API_KEY else "⚠️ Not set (using ATR statistical rules)"
+        url_ok = RENDER_EXTERNAL_URL or "Local / Polling Mode"
+
+        html = (
+            "<html><body style='background:#0b0e14;color:#e5e7eb;font-family:monospace;padding:24px;line-height:1.7;'>"
+            "<h2>📈 Kronos + Gemini Render Diagnostic Dashboard</h2>"
+            f"<div><b>Telegram Bot Status:</b> {BOT_STATUS}</div>"
+            f"<div><b>Kronos Model Status:</b> {MODEL_STATUS}</div><hr style='border-color:#1f2937;'>"
+            f"<div><b>TELEGRAM_BOT_TOKEN:</b> {tok_ok}</div>"
+            f"<div><b>TELEGRAM_CHAT_ID:</b> {cid_ok}</div>"
+            f"<div><b>GEMINI_API_KEY:</b> {gem_ok}</div>"
+            f"<div><b>Render Public URL:</b> {url_ok}</div>"
+            "</body></html>"
+        )
+        self.wfile.write(html.encode("utf-8"))
+
+    def do_POST(self):
+        if self.path.startswith("/webhook"):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length) if length > 0 else b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+            try:
+                update = json.loads(raw_body.decode("utf-8"))
+                uid = update.get("update_id")
+                if uid is not None:
+                    if uid in PROCESSED_UPDATES:
+                        return
+                    PROCESSED_UPDATES.add(uid)
+                    if len(PROCESSED_UPDATES) > 500:
+                        PROCESSED_UPDATES.clear()
+                threading.Thread(target=process_telegram_update, args=(update,), daemon=True).start()
+            except Exception as e:
+                print(f"⚠️ Webhook parse error: {e}", flush=True)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def startup_telegram_and_model():
+    global BOT_STATUS
     if not TELEGRAM_BOT_TOKEN:
-        BOT_STATUS = "⚠️ TELEGRAM_BOT_TOKEN is missing in Render Environment Variables."
+        BOT_STATUS = "❌ TELEGRAM_BOT_TOKEN is missing in Render -> Environment!"
         print(BOT_STATUS, flush=True)
         return
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     try:
-        requests.get(f"{base_url}/deleteWebhook", timeout=10)
-        me = requests.get(f"{base_url}/getMe", timeout=10).json()
+        me = requests.get(f"{base_url}/getMe", timeout=15).json()
         if not me.get("ok"):
-            BOT_STATUS = f"❌ Invalid TELEGRAM_BOT_TOKEN: {me}"
+            BOT_STATUS = f"❌ Invalid TELEGRAM_BOT_TOKEN: {me.get('description')}"
             print(BOT_STATUS, flush=True)
             return
         bot_username = me["result"].get("username", "Bot")
     except Exception as e:
-        BOT_STATUS = f"❌ Telegram connection error: {e}"
+        BOT_STATUS = f"❌ Could not reach Telegram API: {e}"
         print(BOT_STATUS, flush=True)
         return
 
-    offset = None
-    try:
-        init_updates = requests.get(f"{base_url}/getUpdates", timeout=10).json()
-        if init_updates.get("ok") and init_updates.get("result"):
-            offset = init_updates["result"][-1]["update_id"] + 1
-    except Exception:
-        pass
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        wh = requests.post(f"{base_url}/setWebhook", json={"url": webhook_url}, timeout=15).json()
+        if wh.get("ok"):
+            BOT_STATUS = f"🟢 Webhook Active (@{bot_username} -> {webhook_url})"
+        else:
+            BOT_STATUS = f"⚠️ Webhook setup error: {wh}"
+        print(BOT_STATUS, flush=True)
 
-    BOT_STATUS = f"🟢 Online 24/7 on Render (@{bot_username})"
-    print(BOT_STATUS, flush=True)
+        if TELEGRAM_CHAT_ID:
+            requests.post(f"{base_url}/sendMessage", json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": (
+                    f"☁️ <b>@{bot_username} is LIVE on Render (Webhook Mode)!</b>\n"
+                    f"Even if Render sleeps, texting me will wake it up automatically.\n"
+                    f"Try sending <code>NVDA 15m</code> or <code>SHFS 15m</code>!"
+                ),
+                "parse_mode": "HTML"
+            }, timeout=15)
 
-    if TELEGRAM_CHAT_ID:
-        requests.post(f"{base_url}/sendMessage", json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": (
-                f"☁️ <b>@{bot_username} is LIVE on Render Cloud!</b>\n"
-                f"Send any ticker like <code>NVDA 15m</code>, <code>SHFS 15m</code>, or <code>BTCUSDT 1h</code>."
-            ),
-            "parse_mode": "HTML"
-        })
-
-    valid_stock_tf = {"1m", "2m", "5m", "15m", "30m", "1h", "1d"}
-    valid_crypto_tf = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
-
-    while True:
+        # Preload Kronos in background after Telegram is already live
         try:
-            params = {"timeout": 20}
-            if offset is not None:
-                params["offset"] = offset
-            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=25).json()
-
-            if not resp.get("ok"):
-                time.sleep(4)
-                continue
-
-            for item in resp.get("result", []):
-                offset = item["update_id"] + 1
-                msg = item.get("message") or item.get("edited_message") or {}
-                text = (msg.get("text") or "").strip()
-                chat_id = msg.get("chat", {}).get("id")
-
-                if not text or not chat_id:
-                    continue
-
-                if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID).strip():
-                    continue
-
-                if text.lower() in ["/start", "help", "/help"]:
-                    requests.post(f"{base_url}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": "📈 Send a ticker + timeframe (e.g. <code>NVDA 5m</code>, <code>SHFS 15m</code>, <code>BTCUSDT 15m</code>).",
-                        "parse_mode": "HTML"
-                    })
-                    continue
-
-                parts = text.upper().split()
-                req_symbol = parts[0].replace("/", "").lstrip("$")
-                raw_tf = parts[1].lower() if len(parts) > 1 else DEFAULT_INTERVAL
-                req_source = "binance" if req_symbol.endswith(("USDT", "USDC", "BUSD")) else "stocks"
-
-                tf_note = ""
-                if req_source == "stocks":
-                    if raw_tf == "3m":
-                        req_interval = "5m"
-                        tf_note = " <i>(switched 3m &rarr; 5m for Yahoo Finance)</i>"
-                    elif raw_tf in valid_stock_tf:
-                        req_interval = raw_tf
-                    else:
-                        req_interval = DEFAULT_INTERVAL
-                else:
-                    req_interval = raw_tf if raw_tf in valid_crypto_tf else DEFAULT_INTERVAL
-
-                requests.post(f"{base_url}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": f"⏳ Running {SAMPLE_COUNT} Kronos futures on <b>{req_symbol}</b> (<code>{req_interval}</code>)...{tf_note}",
-                    "parse_mode": "HTML"
-                })
-
-                try:
-                    df = fetch_candles(req_symbol, req_interval, LOOKBACK, req_source)
-                    _, paths_matrix = run_kronos_forecast(df, PRED_LEN, SAMPLE_COUNT)
-                    stats = analyze_paths(df, paths_matrix)
-                    backtest = run_backtest_with_fees(req_symbol, req_interval, req_source)
-                    plan = build_verified_trade_plan(req_symbol, req_interval, df, stats, backtest, GEMINI_API_KEY)
-
-                    p10_min = float(np.min(stats["p10_path"]))
-                    caption = (
-                        f"📊 <b>KRONOS + GEMINI: {req_symbol} ({req_interval})</b>\n"
-                        f"• <b>Last Close:</b> <code>{stats['last_close']:,.2f}</code>\n"
-                        f"• <b>Regime:</b> <code>{stats['regime']}</code> ({stats['paths_up']}/{stats['total_paths']} paths up)\n"
-                        f"• <b>Median (+{PRED_LEN} bars):</b> <code>{stats['median_final']:,.2f}</code>\n"
-                        f"• <b>24-Bar p10 – p90:</b> <code>{stats['p10_final']:,.2f}</code> – <code>{stats['p90_final']:,.2f}</code>\n"
-                        f"• <b>Max Path Pullback (p10 low):</b> <code>{p10_min:,.2f}</code>\n"
-                        f"• <b>Backtest (net fees):</b> <code>{backtest['win_rate_pct']}% win</code> (<code>{backtest['net_return_pct']}% net</code>)\n\n"
-                        f"🎯 <b>Plan:</b> {plan['summary']}\n"
-                        f"<code>Entry: {plan['entry']:,.2f} | Stop: {plan['stop_loss']:,.2f} | Target: {plan['target']:,.2f}</code>"
-                    )
-
-                    chart_buf = create_telegram_chart_png(req_symbol, req_interval, df, paths_matrix, stats, plan)
-                    requests.post(
-                        f"{base_url}/sendPhoto",
-                        data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-                        files={"photo": ("forecast.png", chart_buf, "image/png")},
-                        timeout=30
-                    )
-                except Exception as err:
-                    requests.post(f"{base_url}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": f"❌ Could not analyze <code>{req_symbol}</code> ({req_interval}): {err}",
-                        "parse_mode": "HTML"
-                    })
-
-        except Exception:
-            time.sleep(4)
+            ensure_kronos_loaded()
+        except Exception as e:
+            print(f"⚠️ Background preload error: { traceback.format_exc() }", flush=True)
+    else:
+        # Local fallback if not on Render
+        requests.get(f"{base_url}/deleteWebhook", timeout=10)
+        BOT_STATUS = f"🟢 Polling Active (@{bot_username})"
+        ensure_kronos_loaded()
 
 
 if __name__ == "__main__":
-    threading.Thread(target=bootstrap_and_run_bot, daemon=True).start()
+    threading.Thread(target=startup_telegram_and_model, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Binding health-check HTTP server on 0.0.0.0:{port}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
+    print(f"🌐 Server listening on 0.0.0.0:{port}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", port), BotHTTPHandler).serve_forever()
